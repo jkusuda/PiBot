@@ -1,212 +1,213 @@
 import os
-import json
+
 import logging
-from pathlib import Path
-from typing import Dict, Any
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Tuple, Optional
 
 import discord
-from discord import app_commands
-from discord.ui import View, Select
-from discord import SelectOption
+from discord.ext import commands
 from dotenv import load_dotenv
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import gspread
+from google.oauth2.service_account import Credentials
 
-# Config / Logging 
-logging.basicConfig(level=logging.INFO)
+# --- Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log = logging.getLogger("slot-bot")
 
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("api_key")
+TOKEN = os.getenv("DISCORD_TOKEN")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+CREDENTIALS_FILE = "credentials.json"
+CACHE_DURATION_SECONDS = 300  # Cache Google Sheets data for 5 minutes
 
-DATA_FILE = Path("data.json")
-if not DATA_FILE.exists() or DATA_FILE.stat().st_size == 0:
-    DATA_FILE.write_text(json.dumps({}, indent=4))
+# --- Google Sheets Service ---
+class GoogleSheetManager:
+    """Handles all interactions with the Google Sheet, including caching."""
 
-# Data manager
-class DataManager:
-    def __init__(self, path: Path):
-        self.path = path
-
-    def _read(self) -> Dict[str, Any]:
+    def __init__(self, credentials_path: str, sheet_id: str):
+        self.sheet_id = sheet_id
+        self.scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         try:
-            return json.loads(self.path.read_text())
-        except Exception:
-            log.exception("Failed to read data file, returning empty dict.")
-            return {}
+            self.creds = Credentials.from_service_account_file(credentials_path, scopes=self.scopes)
+            self.client = gspread.authorize(self.creds)
+            self.sheet = self.client.open_by_key(self.sheet_id)
+        except FileNotFoundError:
+            log.error(f"Credentials file not found at '{credentials_path}'. Please ensure it exists.")
+            self.client = None
+        except Exception as e:
+            log.error(f"Failed to authorize with Google Sheets: {e}")
+            self.client = None
 
-    def _write(self, data: Dict[str, Any]) -> None:
+        self._schedule_cache: Optional[Dict[str, Any]] = None
+        self._schedule_last_updated: Optional[datetime] = None
+        self._bookers_cache: Optional[List[List[str]]] = None
+        self._bookers_last_updated: Optional[datetime] = None
+
+    def _is_cache_valid(self, last_updated: Optional[datetime]) -> bool:
+        """Checks if the cache is still valid."""
+        if not last_updated:
+            return False
+        return (datetime.now() - last_updated).total_seconds() < CACHE_DURATION_SECONDS
+
+    def get_schedule(self) -> Optional[Dict[str, Any]]:
+        """Fetches the schedule from the sheet, using a cache."""
+        if self.client is None: return None
+
+        if self._is_cache_valid(self._schedule_last_updated) and self._schedule_cache:
+            log.info("Returning schedule from cache.")
+            return self._schedule_cache
+
+        log.info("Fetching fresh schedule data from Google Sheets.")
         try:
-            self.path.write_text(json.dumps(data, indent=4))
-        except Exception:
-            log.exception("Failed to write data file.")
+            worksheet = self.sheet.get_worksheet(5)
+            all_values = worksheet.get_all_values(value_render_option='FORMATTED_VALUE')
 
-    def assign_slot(self, user_id: str, slot_time: str) -> None:
-        data = self._read()
-        data[user_id] = {"time": slot_time, "booked": False}
-        self._write(data)
+            dates = all_values[5][2:9]  # Columns C–I in row 6
+            schedule = {}
 
-    def mark_booked(self, user_id: str) -> bool:
-        data = self._read()
-        if user_id in data:
-            data[user_id]["booked"] = True
-            self._write(data)
-            return True
-        return False
+            for row in all_values[6:]:
+                time = row[1]  # Column B
+                if not time:
+                    break
 
-    def get_assignments(self) -> Dict[str, Any]:
-        return self._read()
+                schedule[time] = {
+                    date: value if value else "NOT BOOKED"
+                    for date, value in zip(dates, row[2:9])
+                }
+            
+            self._schedule_cache = schedule
+            self._schedule_last_updated = datetime.now()
+            return self._schedule_cache
+        except gspread.exceptions.APIError as e:
+            log.error(f"GSpread API Error while fetching schedule: {e}")
+            return None
+        except Exception as e:
+            log.error(f"An unexpected error occurred while fetching schedule: {e}")
+            return None
 
-data_mgr = DataManager(DATA_FILE)
 
-# UI: Select + View
-class TimeSelect(Select):
-    def __init__(self, target_user: discord.User, data_mgr: DataManager):
-        options = [
-            SelectOption(label="09:00", description="9 AM slot", value="09:00"),
-            SelectOption(label="11:00", description="11 AM slot", value="11:00"),
-            SelectOption(label="14:00", description="2 PM slot", value="14:00"),
-            SelectOption(label="16:00", description="4 PM slot", value="16:00"),
-        ]
-        super().__init__(
-            placeholder="Select a time slot",
-            min_values=1,
-            max_values=1,
-            options=options
-        )
-        self.target_user = target_user
-        self.data_mgr = data_mgr
+    def get_bookers(self) -> Optional[List[List[str]]]:
+        """Fetches the list of bookers from the sheet, using a cache."""
+        if self.client is None: return None
 
-    async def callback(self, interaction: discord.Interaction):
-        selected_time = self.values[0]
+        if self._is_cache_valid(self._bookers_last_updated) and self._bookers_cache:
+            log.info("Returning bookers from cache.")
+            return self._bookers_cache
+
+        log.info("Fetching fresh bookers data from Google Sheets.")
         try:
-            self.data_mgr.assign_slot(str(self.target_user.id), selected_time)
-        except Exception:
-            log.exception("Error assigning slot")
-            await interaction.response.send_message("❌ Failed to save assignment.", ephemeral=True)
+            worksheet = self.sheet.get_worksheet(0)
+            all_values = worksheet.get_all_values()
+            
+            bookers = [row[0:2] for row in all_values[1:9]]
+
+            self._bookers_cache = bookers
+            self._bookers_last_updated = datetime.now()
+            return self._bookers_cache
+        except gspread.exceptions.APIError as e:
+            log.error(f"GSpread API Error while fetching bookers: {e}")
+            return None
+        except Exception as e:
+            log.error(f"An unexpected error occurred while fetching bookers: {e}")
+            return None
+
+
+# --- Bot Implementation ---
+class MyBot(commands.Bot):
+    def __init__(self, sheet_manager: GoogleSheetManager):
+        intents = discord.Intents.default()
+        intents.members = True
+        super().__init__(command_prefix="!", intents=intents)
+        self.sheet_manager = sheet_manager
+
+    async def on_ready(self):
+        log.info(f'Logged in as {self.user} (ID: {self.user.id})')
+        log.info('Syncing commands to the global command tree...')
+        try:
+            synced = await self.tree.sync()
+            log.info(f"Synced {len(synced)} commands.")
+        except Exception as e:
+            log.error(f"Failed to sync commands: {e}")
+
+    async def setup_hook(self):
+        log.info("Bot is starting up...")
+
+# --- Bot Setup ---
+if not TOKEN:
+    log.critical("FATAL: DISCORD_TOKEN environment variable not set.")
+else:
+    sheet_manager = GoogleSheetManager(CREDENTIALS_FILE, SHEET_ID)
+    bot = MyBot(sheet_manager)
+
+    @bot.tree.command(name="bookers", description="Show who's responsible for booking PI.")
+    async def bookers(interaction: discord.Interaction):
+        """Displays the current assignments in an embed."""
+        await interaction.response.defer(ephemeral=True)
+        
+        data = bot.sheet_manager.get_bookers()
+        if data is None:
+            await interaction.followup.send("Sorry, I couldn't fetch data from Google Sheets right now. Please try again later.", ephemeral=True)
+            return
+        if not data:
+            await interaction.followup.send("There are no assignments to show.", ephemeral=True)
             return
 
-        try:
-            await self.target_user.send(f"📅 You were assigned a slot at **{selected_time}** by {interaction.user}.")
-        except Exception:
-            pass
+        embed = discord.Embed(
+            title="📋 Current Bookers",
+            description="Status of all available time slots.",
+            color=discord.Color.blue()
+        )
 
-        await interaction.response.send_message(
-            f"✅ Assigned {self.target_user.mention} to **{selected_time}**.",
+        for time, name in data:
+            is_booked = bool(name.strip())
+            status_emoji = "✅" if is_booked else "❌"
+            display_name = name if is_booked else "Not Assigned"
+            embed.add_field(name=f"{status_emoji} {time}", value=display_name, inline=False)
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @bot.tree.command(name="bookings", description="Check the status of the current PI booking")
+    async def bookings(interaction: discord.Interaction):
+        """Checks if the current time slot is booked and for how long."""
+        await interaction.response.defer(ephemeral=True)
+        
+        schedule = bot.sheet_manager.get_schedule()
+        if schedule is None:
+            await interaction.followup.send("Sorry, I couldn't fetch the schedule from Google Sheets. Please try again later.", ephemeral=True)
+            return
+
+        now = datetime.now()
+        today_str = now.strftime("%#m/%#d/%Y")
+
+        # Round down to the nearest 30-minute mark
+        rounded_minute = 0 if now.minute < 30 else 30
+        current_slot_dt = now.replace(minute=rounded_minute, second=0, microsecond=0)
+        
+        # Format time key for dictionary lookup (e.g., "8:30 am")
+        current_time_key = current_slot_dt.strftime("%#I:%M %p").lower()
+        
+        current_status = schedule.get(current_time_key, {}).get(today_str, "NOT BOOKED")
+
+        if current_status != "BOOKED":
+            await interaction.followup.send(f"The current slot ({current_time_key}) is **{current_status}** ❌.", ephemeral=True)
+            return
+
+        # If booked, find the end time by checking subsequent slots
+        end_time_dt = current_slot_dt
+        while True:
+            end_time_dt += timedelta(minutes=30)
+            next_day_str = end_time_dt.strftime("%#m/%#d/%Y")
+            next_time_key = end_time_dt.strftime("%#I:%M %p").lower()
+            
+            next_status = schedule.get(next_time_key, {}).get(next_day_str, "NOT BOOKED")
+            
+            if next_status != "BOOKED":
+                end_time_str = end_time_dt.strftime("%#I:%M %p").lower()
+                break
+        
+        await interaction.followup.send(
+            f"The current slot ({current_time_key}) is **BOOKED** until **{end_time_str}** ✅. Happy Studying!",
             ephemeral=True
         )
 
-        if self.view:
-            self.view.stop()
-
-class TimeSelectView(View):
-    def __init__(self, target_user: discord.User, data_mgr: DataManager, timeout: float = 60.0):
-        super().__init__(timeout=timeout)
-        self.add_item(TimeSelect(target_user, data_mgr))
-
-# Bot Setup
-intents = discord.Intents.default()
-intents.members = True
-
-class SlotClient(discord.Client):
-    def __init__(self, *, intents: discord.Intents):
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-        self.scheduler = AsyncIOScheduler()
-
-    async def setup_hook(self):
-        await self.tree.sync()
-        self.scheduler.start()
-        self.scheduler.add_job(self.reminder_1155, 'cron', hour=23, minute=3)
-        self.scheduler.add_job(self.reminder_1200, 'cron', hour=0, minute=0)
-        self.scheduler.add_job(self.reminder_900, 'cron', hour=9, minute=0)
-
-    async def send_reminder(self, only_unbooked: bool = False, include_markbook_instruction: bool = False):
-        BOOKING_SITE = "https://libcal.uflib.ufl.edu/space/28257"
-        SPREADSHEET = "https://docs.google.com/spreadsheets/d/15N-sULElmb4B3t1UEnwiZQCUpnQ9iKcJrBbBF2URRaU/"
-
-        data = data_mgr.get_assignments()
-        for uid, info in data.items():
-            if only_unbooked and info.get("booked", False):
-                continue
-
-            try:
-                user = await self.fetch_user(int(uid))
-                booked = info.get("booked", False)
-                color = discord.Color.green() if booked else discord.Color.blue()
-
-                embed = discord.Embed(
-                    title="⏰ Slot Reminder",
-                    description="Here are your slot details:",
-                    color=color
-                )
-                embed.add_field(name="Time", value=info.get("time", "N/A"), inline=False)
-                embed.add_field(name="Status", value="✅ Booked" if booked else "❌ Not booked", inline=False)
-                embed.add_field(name="Booking Site", value=f"[Click here to book]({BOOKING_SITE})", inline=False)
-
-                if include_markbook_instruction:
-                    embed.add_field(
-                        name="Next Steps",
-                        value=f"Remember to mark your time as booked using the `/markbooked` command "
-                              f"and update the [spreadsheet]({SPREADSHEET}).",
-                        inline=False
-                    )
-
-                await user.send(embed=embed)
-
-            except Exception as e:
-                log.warning(f"Failed to DM {uid}: {e}")
-
-    async def reminder_1155(self):
-        await self.send_reminder(only_unbooked=False, include_markbook_instruction=False)
-
-    async def reminder_1200(self):
-        await self.send_reminder(only_unbooked=False, include_markbook_instruction=True)
-
-    async def reminder_900(self):
-        await self.send_reminder(only_unbooked=True, include_markbook_instruction=True)
-
-client = SlotClient(intents=intents)
-
-# Commands
-@client.tree.command(name="assignslot", description="Assign a time slot to a user")
-async def assignslot(interaction: discord.Interaction, user: discord.User):
-    view = TimeSelectView(user, data_mgr, timeout=60.0)
-    await interaction.response.send_message(
-        f"Select a time slot for {user.mention}:",
-        view=view,
-        ephemeral=True
-    )
-
-@client.tree.command(name="markbooked", description="Mark a user's slot as booked")
-async def markbooked(interaction: discord.Interaction, user: discord.User):
-    success = data_mgr.mark_booked(str(user.id))
-    if success:
-        await interaction.response.send_message(f"✅ Marked {user.mention}'s slot as booked", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"⚠️ No slot found for {user.mention}", ephemeral=True)
-
-@client.tree.command(name="showassignments", description="Show all assignments")
-async def showassignments(interaction: discord.Interaction):
-    data = data_mgr.get_assignments()
-    if not data:
-        await interaction.response.send_message("No assignments yet.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title="📋 Current Assignments",
-        color=discord.Color.blurple()
-    )
-    for uid, info in data.items():
-        booked_status = "✅ Booked" if info.get("booked") else "❌ Not booked"
-        try:
-            user = await client.fetch_user(int(uid))
-            embed.add_field(name=str(user), value=f"{info.get('time')} ({booked_status})", inline=False)
-        except Exception:
-            embed.add_field(name=f"User ID {uid}", value=f"{info.get('time')} ({booked_status})", inline=False)
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-if not TOKEN:
-    log.critical("No bot token found. Set DISCORD_TOKEN or api_key in your environment.")
-else:
-    client.run(TOKEN)
+    bot.run(TOKEN)
